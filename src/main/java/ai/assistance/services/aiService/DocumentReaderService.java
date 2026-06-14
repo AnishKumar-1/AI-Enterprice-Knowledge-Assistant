@@ -7,6 +7,7 @@ import ai.assistance.models.ChatMessage;
 import ai.assistance.models.CustomDocument;
 import ai.assistance.repositories.ChatMessageRepository;
 import ai.assistance.repositories.DocumentRepo;
+import ai.assistance.searchRecord.RankedResult;
 import jakarta.transaction.Transactional;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -23,10 +24,8 @@ import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.util.Comparator;
-import java.util.List;
-import java.util.Optional;
-import java.util.UUID;
+import javax.naming.directory.SearchResult;
+import java.util.*;
 import java.util.stream.Collectors;
 
 import static ai.assistance.helpers.FileHelper.extractTextFromFile;
@@ -42,12 +41,14 @@ public class DocumentReaderService {
     private final ChatClient chatClient;
     private final ChatMessageRepository chatMessageRepository;
     private final ChatMemory chatMemory;
+    private final DocumentSearchService documentSearchService;
 
     public DocumentReaderService(VectorStore vectorStore,
                                  DocumentRepo documentRepo, JdbcTemplate jdbcTemplate,
                                  @Qualifier("openAiChatModel") ChatModel chatModel,
                                  ChatMessageRepository chatMessageRepository,
-                                 ChatMemory chatMemory) {
+                                 ChatMemory chatMemory,
+                                 DocumentSearchService documentSearchService) {
 
         this.vectorStore = vectorStore;
         this.documentRepo = documentRepo;
@@ -55,6 +56,7 @@ public class DocumentReaderService {
         this.chatClient = ChatClient.create(chatModel);
         this.chatMessageRepository = chatMessageRepository;
         this.chatMemory = chatMemory;
+        this.documentSearchService = documentSearchService;
     }
 
 
@@ -177,7 +179,6 @@ public class DocumentReaderService {
     // and user question to prompt
 
 
-
     public AiResponseDto ask_question(AiRequest userQuestion) {
 
         String question = userQuestion.getQuery();
@@ -185,43 +186,51 @@ public class DocumentReaderService {
         UUID conversationId = userQuestion.getConversationId() != null
                 ? userQuestion.getConversationId()
                 : UUID.randomUUID();
-
+//creating SearchRequest class object as vectorStorre require its object to perform similarity search
         SearchRequest searchRequest = SearchRequest.builder()
                 .query(question)
                 .topK(5)
                 .similarityThreshold(0.30)
                 .build();
 
-        List<Document> chunks = vectorStore.similaritySearch(searchRequest);
+        //performing semantic search with the help of spring ai vectorStore interface which has method to perform it and its from spring ai
+        List<Document> semanticResults = vectorStore.similaritySearch(searchRequest);
+        //peforming postgre full text search and ranking to get the best result
+        List<RankedResult> keywordResults = documentSearchService.fullTextSearchWithRank(question);
 
-        String context = chunks.stream()
-                .map(Document::getText)
-                .collect(Collectors.joining("\n\n"))
+        //creating linkedHashSet to remove duplicate keys and store result
+        Set<String> mergedResults = new LinkedHashSet<>();
+        semanticResults.forEach(result -> mergedResults.add(result.getText()));
+        //adding keyword result
+        keywordResults.forEach(result -> mergedResults.add(result.content()));
+
+        String context = String.join("\n\n", mergedResults)
                 .replaceAll("\\s+", " ")
                 .trim();
 
+
         String systemPrompt = """
-            You are an internal document assistant.
-
-            Use conversation history when the user refers to previous messages.
-
-            Use retrieved context when the user asks about documents.
-
-            If the answer is available in either conversation history
-            or retrieved context, answer it.
-
-            If the answer cannot be found in either place, reply:
-
-            "This is not present in the internal document."
-            """;
+                You are an internal document assistant.
+                
+                Use conversation history when the user refers to previous messages.
+                
+                Use retrieved context when the user asks about documents.
+                
+                If the answer is available in either conversation history
+                or retrieved context, answer it.
+                
+                If the answer cannot be found in either place, reply:
+                
+                "This is not present in the internal document."
+                """;
 
         String userPrompt = """
-            Context:
-            %s
-
-            Question:
-            %s
-            """.formatted(context, question);
+                Context:
+                %s
+                
+                Question:
+                %s
+                """.formatted(context, question);
 
         String aiResult = chatClient.prompt()
                 .system(systemPrompt)
@@ -239,5 +248,52 @@ public class DocumentReaderService {
                 aiResult
         );
     }
+
+
+    //combine both result and get search by rank or sort it
+//    private List<SearchResult> performRrfRanking(
+//            List<Document> semanticResults,
+//            List<SearchResult> keywordResults) {
+//
+//        Map<String, Double> scores =
+//                new HashMap<>();
+//        //semantic based ranking
+//        int k = 60;
+//
+//        for (int i = 0; i < semanticResults.size(); i++) {
+//
+//            String content =
+//                    semanticResults.get(i).getText();
+//
+//            double score =
+//                    1.0 / (k + i + 1);
+//
+//            scores.merge(
+//                    content,
+//                    score,
+//                    Double::sum
+//            );
+//        }
+//
+//
+//        //keyword based ranking
+//
+//        for (int i = 0; i < keywordResults.size(); i++) {
+//
+//            String content =
+//                    keywordResults.get(i).content();
+//
+//            double score =
+//                    1.0 / (k + i + 1);
+//
+//            scores.merge(
+//                    content,
+//                    score,
+//                    Double::sum
+//            );
+//        }
+//
+//
+//    }
 
 }
